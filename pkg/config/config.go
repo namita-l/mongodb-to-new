@@ -14,6 +14,7 @@ type Config struct {
 	CheckpointInterval     int            `json:"checkpointInterval"`     // Checkpoint interval in minutes
 	ForceOrderedOperations bool           `json:"forceOrderedOperations"` // Force ordered operations for all types
 	FlushIntervalMs        int            `json:"flushIntervalMs"`        // Flush interval in milliseconds
+	GCPProjectID           string         `json:"gcpProjectID,omitempty"` // GCP Project ID for exporting OpenTelemetry metrics
 
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration

@@ -13,22 +13,32 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"github.com/gsbingo17/mongodb-migration/pkg/monitoring"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Migrator handles the migration and replication process
 type Migrator struct {
-	config *config.Config
-	log    *logger.Logger
+	config               *config.Config
+	log                  *logger.Logger
+	documentsReadCounter metric.Int64Counter
 }
 
 // NewMigrator creates a new migrator
 func NewMigrator(config *config.Config, log *logger.Logger) *Migrator {
+	documentsReadCounter, err := monitoring.NewDocumentsReadCounter()
+	if err != nil {
+		log.Errorf("failed to create documents_read_total counter: %v", err)
+	}
+
 	return &Migrator{
-		config: config,
-		log:    log,
+		config:               config,
+		log:                  log,
+		documentsReadCounter: documentsReadCounter,
 	}
 }
 
@@ -740,6 +750,13 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					close(partitionBatchChan)
 					errorChan <- fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
 					return
+				}
+
+				// Increment documents read counter
+				if m.documentsReadCounter != nil {
+					m.documentsReadCounter.Add(ctx, 1, metric.WithAttributes(
+						attribute.String("collection", collConfig.SourceCollection),
+					))
 				}
 
 				// Add to batch

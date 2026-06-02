@@ -12,6 +12,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"github.com/gsbingo17/mongodb-migration/pkg/migration"
+	"github.com/gsbingo17/mongodb-migration/pkg/monitoring"
 )
 
 func main() {
@@ -48,6 +49,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize monitoring
+	shutdownMonitoring, err := monitoring.Init(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize monitoring: %v", err)
+	}
+	defer shutdownMonitoring()
+
 	// Handle interrupt signals
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
@@ -80,7 +88,6 @@ func main() {
 	if *mode == "migrate" {
 		duration := time.Since(startTime)
 		log.Infof("Migration completed in %.2f seconds", duration.Seconds())
-		os.Exit(0) // Explicitly exit after migration is complete
 	}
 }
 
