@@ -9,10 +9,60 @@ This Go application replicates data from one MongoDB database to another MongoDB
 
 ## Prerequisites
 
+### General Requirements
 - Go 1.21 or later
-- MongoDB server running and accessible
-- **MongoDB server configured to allow change streams (requires MongoDB 3.6 or later and a replica set)** 
-- For live replication, the source MongoDB must be running as a replica set
+- MongoDB servers running and accessible (both source and target)
+
+### Replication Method Requirements
+
+The tool supports three replication methods for live mode, each with different prerequisites:
+
+#### 1. Change Stream Replication (Default - `replicationMethod: "changestream"`)
+- **Source MongoDB**: Version 3.6 or later
+- **Replica Set**: Source MongoDB **must** be running as a replica set
+- **Recommended for**: Modern MongoDB deployments (3.6+)
+- **Advantages**: 
+  - High-level API with server-side filtering
+  - Structured change events
+  - Official MongoDB feature with long-term support
+
+#### 2. Oplog Replication (`replicationMethod: "oplog"`)
+- **Source MongoDB**: Any version with replica set support (2.0+)
+- **Replica Set**: Source MongoDB **must** be running as a replica set (oplog only exists on replica sets)
+- **Wire Protocol**: Modern wire protocol (version 6+)
+- **Recommended for**:
+  - MongoDB 3.0, 3.2, 3.4 (wire protocol version 6)
+  - Scenarios requiring low-level oplog access
+- **Advantages**:
+  - Works with older MongoDB versions that don't support change streams
+  - Direct access to operation log
+
+#### 3. Legacy Oplog Replication (`replicationMethod: "oplog-legacy"`)
+- **Source MongoDB**: MongoDB 3.0, 3.2, 3.4 (wire protocol version 3)
+- **Replica Set**: Source MongoDB **must** be running as a replica set
+- **Target MongoDB**: Modern MongoDB (3.6+) or MongoDB-compatible databases (e.g., Firestore)
+- **Recommended for**: 
+  - Migrating from very old MongoDB versions (3.0/3.2) to modern MongoDB
+  - Bridging the gap between legacy and modern MongoDB versions
+- **Implementation**:
+  - Uses dual-driver architecture (mgo for source, mongo-driver for target)
+  - Leverages GTM legacy library for oplog tailing
+  - Full initial migration + incremental replication support
+
+### Target MongoDB Requirements
+- **Migrate mode**: Any MongoDB version
+- **Live mode**: No specific version requirements (receives standard insert/update/delete operations)
+
+### Quick Decision Guide
+
+| Your Source MongoDB | Recommended Method | Configuration |
+|-------------------|-------------------|---------------|
+| MongoDB 3.6 or later | Change Streams | `"replicationMethod": "changestream"` (default) |
+| MongoDB 3.0, 3.2, 3.4 (wire v6) | Oplog | `"replicationMethod": "oplog"` |
+| MongoDB 3.0, 3.2, 3.4 (wire v3) | Legacy Oplog | `"replicationMethod": "oplog-legacy"` |
+| Single-node deployment | Migrate mode only | Not applicable (live mode requires replica set) |
+
+**Note**: All live replication methods require the source MongoDB to be running as a replica set. See "Setting Up a Single-Node Replica Set for Development" section below for local development setup.
 
 ## Installation
 
@@ -61,6 +111,29 @@ Here's a basic example:
 
 When no collections are specified, the tool will automatically detect all collections in the source database and migrate them to the target database with the same collection names.
 
+### Global Database-Level Upsert
+
+If you want to enable upsert mode globally for all collections (both explicitly mapped and auto-detected collections), you can specify `"upsertMode": true` at the target database level:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "target_db",
+        "upsertMode": true
+      }
+    }
+  ],
+  "saveThreshold": 1000
+}
+```
+
 ### Specific Collections Migration
 
 If you want to migrate only specific collections or rename collections during migration, you can specify them explicitly:
@@ -96,10 +169,11 @@ If you want to migrate only specific collections or rename collections during mi
 - **databasePairs**: An array of objects, each defining a source MongoDB database and a target MongoDB database to replicate.
 - **connectionString**: The MongoDB connection string for source and target databases.
 - **database**: The name of the MongoDB database for source and target.
+- **upsertMode**: (Optional, target-level) Whether to use upsert operations globally by default for all collections in this target database instead of standard inserts. Default is false.
 - **collections**: (Optional) An array of objects, each defining a source MongoDB collection and a target MongoDB collection to replicate. If omitted, all collections will be migrated with the same names.
   - **sourceCollection**: The name of the collection in the source database.
   - **targetCollection**: The name of the collection in the target database.
-  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts. Default is false.
+  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts for this specific collection (overrides/complements the database-level default). Default is false.
 
 #### Checkpoint Configuration
 - **saveThreshold**: The number of changes to process before saving the resume token (for live replication).
@@ -112,10 +186,16 @@ If you want to migrate only specific collections or rename collections during mi
 - **initialMigrationWorkers**: Number of worker goroutines for batch processing during standard migration (default: 5).
 - **concurrentCollections**: Number of collections to process concurrently (default: 4).
 - **incrementalReadBatchSize**: Number of change events to read at once (default: 8192).
+- **incrementalStreamPartitions**: Number of parallel sharded change stream readers at MongoDB source level (default: 1).
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
+- **groupOpsByDistinctId**: Enable key-collision grouping in live replication instead of optype-based grouping (default: false).
 - **flushIntervalMs**: Flush interval in milliseconds for operation groups (default: 500).
+- **targetMinPoolSize**: Minimum MongoDB connection pool size for target database (default: 128).
+- **targetMaxPoolSize**: Maximum MongoDB connection pool size for target database (default: 256).
+- **incrementalIncomingQueueSize**: Buffer size of the concurrent workers' raw events queue channel (default: 8192).
+- **incrementalProcessingQueueSize**: Buffer size of the concurrent workers' writing batches queue channel (default: 4096). Bounding this to a small number (e.g. 2 or 4) applies strict in-memory backpressure, preventing memory backups and capping Queue Latency under slow writes.
 - **forceOrderedOperations**: Whether to force ordered operations for all operation types (default: false). When false, insert and delete operations use unordered bulk writes for better performance, while update and replace operations always use ordered bulk writes to ensure consistency.
 
 #### Parallel Reads Configuration
@@ -136,19 +216,23 @@ If you want to migrate only specific collections or rename collections during mi
   - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
 
 #### Index Synchronization Configuration
-- **indexes**: (Optional) An array of index configurations for synchronizing indexes from source to target collections.
+- **syncAllIndexes**: (Optional) When set to `true`, automatically syncs all indexes (excluding `_id_`) from every source collection to the corresponding target collection. Default is `false`.
+- **indexOnly**: (Optional) When set to `true`, the tool **only syncs indexes** and skips all data migration and incremental replication. The process exits after all indexes are created. Must be used with `syncAllIndexes: true` or explicit `indexes` configuration. Default is `false`.
+- **indexes**: (Optional) An array of index configurations for synchronizing specific indexes from source to target collections.
   - **sourceCollection**: The name of the source collection containing the indexes to sync.
   - **indexNames**: An array of index names to synchronize (the tool will retrieve the full index definitions from the source).
 
 **Index Sync Behavior:**
 - Index synchronization occurs **only during initial migration** (not during incremental replication)
 - Indexes are created on the target collection **before data migration** begins
+- **Skip existing indexes**: If an index already exists on the target collection, it is skipped (no duplicate creation attempts)
 - The tool automatically resolves the target collection name:
   - If a mapping is defined in the `collections` configuration, it uses the mapped target collection name
   - If no mapping is found, it assumes the target collection has the same name as the source collection
 - **Non-blocking errors**: If index creation fails, the tool logs a warning and continues with data migration
 - **Preserves existing indexes**: Indexes already present on the target collection that don't exist in the source are kept unchanged
 - The `_id_` index is automatically skipped as it's created by MongoDB
+- **Async with throttling**: Index builds are launched asynchronously with a concurrency limit of 1 to prevent Firestore cross-transaction contention. Each build uses a dedicated client with no socket timeout so long-running index builds are not killed.
 
 **Example Configuration:**
 ```json
@@ -188,6 +272,172 @@ In this example:
 - The `email_1` and `created_at_-1` indexes from the `users` collection will be created on the `app_users` collection (following the collection mapping)
 - The `user_id_1` and `status_1_created_at_-1` indexes from the `orders` collection will be created on the `orders` collection (same name, no mapping)
 
+#### Index-Only Replication
+
+If you want to **only sync indexes** without migrating any data, set `indexOnly` to `true`. This is useful when:
+- You want to pre-create indexes on the target before running a full migration
+- You need to sync indexes independently of data migration
+- You want to verify index compatibility with the target (e.g., Firestore)
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://target:27017",
+        "database": "target_db",
+        "syncAllIndexes": true,
+        "indexOnly": true
+      }
+    }
+  ]
+}
+```
+
+**Index-Only Replication Behavior:**
+- Works with all modes: `migrate`, `changestream`, `oplog`, and `oplog-legacy`
+- Reads all index definitions from the source database
+- Skips indexes that already exist on the target (no duplicate creation)
+- Creates indexes asynchronously with throttling (one at a time) to prevent Firestore cross-transaction contention
+- Waits for all index builds to complete before exiting
+- **No data is migrated** — only index definitions are synced
+- **No incremental replication** — the process exits after indexes are created (no oplog tailing or change stream)
+
+You can run it with either mode:
+```bash
+# Using migrate mode (simplest — no replica set needed for target)
+./migrate -mode=migrate
+
+# Using live mode (will sync indexes and exit without starting replication)
+./migrate -mode=live
+```
+
+#### Replication Method Configuration
+- **replicationMethod**: (Optional) Specifies the replication method for live mode. Possible values:
+  - `"changestream"` (default): Uses MongoDB change streams for incremental replication (requires MongoDB 3.6+ with replica set)
+  - `"oplog"`: Uses MongoDB oplog tailing for incremental replication (works with older MongoDB versions)
+
+**Oplog-Based Replication:**
+
+For databases that don't support change streams or for legacy MongoDB versions, you can use oplog-based replication:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://legacy:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "new_db",
+        "collections": [
+          {
+            "sourceCollection": "orders",
+            "targetCollection": "orders"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Legacy MongoDB Support (MongoDB 3.0/3.2):**
+
+For very old MongoDB versions (3.0, 3.2) that use wire protocol version 3, use the `oplog-legacy` replication method:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://oldserver:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://newserver:27018",
+        "database": "modern_db"
+      }
+    }
+  ]
+}
+```
+
+When no `collections` are specified (as above), the tool will automatically detect all collections in the source database using the legacy mgo driver and migrate them to the target database with the same collection names. You can also specify explicit collection mappings if you want to rename collections during migration:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://oldserver:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://newserver:27018",
+        "database": "modern_db",
+        "collections": [
+          { "sourceCollection": "users", "targetCollection": "app_users" },
+          { "sourceCollection": "orders", "targetCollection": "orders" }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Legacy Mode Implementation:**
+- Uses **mgo driver** for source MongoDB (supports wire version 3)
+- Uses **modern mongo-driver** for target MongoDB (supports wire version 12+)
+- Both drivers coexist in the same binary without conflicts
+- Leverages GTM legacy library with mgo for oplog tailing
+- Supports full initial migration + incremental replication
+- Perfect for migrating from MongoDB 3.0/3.2 to modern MongoDB/Firestore
+
+**When to Use oplog-legacy:**
+- Source MongoDB version 3.0, 3.2, or 3.4 (wire version 3)
+- Target MongoDB is modern version (3.6+ or wire version 6+)
+- You need to bridge the gap between very old and very new MongoDB versions
+
+**When to Use Oplog Replication (Standard):**
+- Source database doesn't support change streams
+- Migrating from MongoDB versions earlier than 3.6
+- Source MongoDB doesn't have change streams enabled
+- You need lower-level access to the operation log
+
+**Oplog Replication Behavior:**
+- Requires source MongoDB to be running as a replica set (oplog only exists on replica sets)
+- Uses the GTM (Go Tail Mongo) library for robust oplog tailing
+- Automatically handles reconnection and resume from last processed timestamp
+- Stores resume position in `oplogTimestamp-global.json` file
+- Same seamless initial + incremental migration flow as change streams:
+  1. Captures current oplog timestamp before initial migration
+  2. Performs full initial migration (including index sync if configured)
+  3. Starts tailing oplog from captured timestamp to catch all changes during migration
+- Filters operations to only process configured collections
+- Supports insert, update, and delete operations
+- Automatically converts oplog operations to unified event format
+
+**Oplog vs Change Streams:**
+
+| Feature | Change Streams | Oplog |
+|---------|---------------|-------|
+| MongoDB Version | 3.6+ | All versions with replica set |
+| API Level | High-level, structured events | Low-level, raw oplog entries |
+| Server-side Filtering | Yes | No (filtered client-side) |
+| Resume Token | Opaque binary token | Timestamp-based |
+| Recommended For | Modern MongoDB (3.6+) | Legacy MongoDB or special cases |
+
 ## Usage
 
 1. Migrate Mode:
@@ -214,19 +464,25 @@ In this example:
    ./migrate -help
    ```
 
-   This will display all available command-line options:
+    This will display all available command-line options:
 
-   ```
-   Options:
-     -config string
-           Path to configuration file (default "mongodb_replication_config.json")
-     -mode string
-           Operation mode: 'migrate' or 'live' (default "migrate")
-     -log-level string
-           Log level: debug, info, warn, error (default "info")
-     -help
-           Display this help information
-   ```
+    ```
+    Options:
+      -config string
+            Path to configuration file (default "mongodb_replication_config.json")
+      -mode string
+            Operation mode: 'migrate', 'live', or 'live-only' (default "migrate")
+      -log-level string
+            Log level: debug, info, warn, error (default "info")
+      -log-file string
+            Path to log file (logs to both stdout and file when specified)
+      -live-start-timestamp string
+            Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
+      -dry-run
+            Dry run mode (live-only migrations only, drops all events in reader)
+      -help
+            Display this help information
+    ```
 
 ## Key Features
 
@@ -261,10 +517,12 @@ The application implements parallelism at multiple levels to maximize performanc
    - Provides an additional level of parallelism for large collections
 
 5. **Change Stream Parallelism** (Live Mode):
-   - In live mode, a client-level change stream watches all collections
-   - Change events are distributed to workers based on document ID hash
-   - Controlled by the `incrementalWorkerCount` parameter (default: CPU cores)
-   - Ensures operations for the same document are always processed by the same worker
+   - **Sharded Ingestion Partitions**: Controlled by `incrementalStreamPartitions`. The system spawns parallel sharded change streams at the MongoDB source level
+   - **Hashing-based Server-Side Filtering**: At ingestion time, the system splits the change streams lock-freely using a server-side modulo hash filter on document ID values:
+     `hash(documentKey._id) % totalPartitions == partitionIndex`
+     This ensures that each of the parallel change streams receives a completely disjoint, non-overlapping subset of oplog events, enabling parallelized high-throughput ingestion
+   - **Worker Hash Distribution**: Within the replicator, the `partition router` further distributes events across `transformer and batcher` worker threads (controlled by `incrementalWorkerCount`) using document ID key hashing
+   - **Sequential Consistency**: This ensures that all operations for the same document ID always go to the same worker and are processed in their strict chronological sequence
 
 ### Tuning Parallelism Parameters
 
@@ -417,6 +675,9 @@ This will allow you to use change streams, which are required for the live repli
 - `pkg/logger/`: Logging utilities.
 - `pkg/migration/`: Migration and replication logic.
   - `client_stream.go`: Client-level change stream implementation
+  - `oplog_replicator.go`: Oplog-based replication implementation using GTM
+  - `oplog_timestamp.go`: Oplog timestamp tracking and persistence
+  - `oplog_converter.go`: GTM operation to event conversion
   - `migrator.go`: Core migration and replication logic
   - `resumetoken.go`: Resume token management
   - `parallel.go`: Parallel processing implementation for live mode

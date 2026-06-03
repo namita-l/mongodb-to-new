@@ -2,23 +2,33 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"github.com/gsbingo17/mongodb-migration/pkg/migration"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func main() {
 	// Parse command-line flags
 	configPath := flag.String("config", "mongodb_replication_config.json", "Path to configuration file")
-	mode := flag.String("mode", "migrate", "Operation mode: 'migrate' or 'live'")
+	mode := flag.String("mode", "migrate", "Operation mode: 'migrate', 'live', or 'live-only'")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
+	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	dontApply := flag.Bool("dont-apply", false, "Don't apply mode (live-only migrations only, drops all target writes)")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
+	verifySampleSize := flag.Int("verify-sample-size", 1000, "Number of random documents to verify per collection when mode is 'verify'")
+	verifyReportFile := flag.String("verify-report-file", "verification_report.json", "Path to save the detailed JSON verification report")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -32,16 +42,62 @@ func main() {
 	log := logger.New()
 	log.SetLevel(*logLevel)
 
+	// Maximize open file descriptor resource limits (ulimit -n 65536)
+	maximizeOpenFileLimit(log)
+
+	// Set up log file if specified
+	if *logFile != "" {
+		file, err := log.SetOutputFile(*logFile)
+		if err != nil {
+			log.Fatalf("Failed to open log file %s: %v", *logFile, err)
+		}
+		defer file.Close()
+		log.Infof("Logging to file: %s", *logFile)
+	}
+
 	// Load configuration
 	log.Info("Loading configuration...")
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	// Display and log the loaded configuration with sensitive values masked
+	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
+
+
 
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate' or 'live'", *mode)
+	if *mode != "migrate" && *mode != "live" && *mode != "live-only" && *mode != "verify" {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', or 'verify'", *mode)
+	}
+
+	// Validate dry-run and read-only options
+	// Validate dont-apply and read-only options
+	if *dontApply && *mode != "live-only" {
+		log.Fatal("Error: -dont-apply can only be specified when -mode is 'live-only'")
+	}
+	if *dryRun && *mode != "live-only" {
+		log.Fatal("Error: -dry-run can only be specified when -mode is 'live-only'")
+	}
+	if *dontApply && *dryRun {
+		log.Fatal("Error: -dont-apply and -dry-run are mutually exclusive")
+	}
+
+	// Parse and validate -live-start-timestamp option.
+	// This flag specifies a custom historical starting point (Unix epoch seconds or RFC3339 date)
+	// from which the incremental change stream/oplog replication should begin.
+	// Note: This is only valid in "live-only" mode because standard migration modes always
+	// automatically capture the starting position prior to performing the initial copy phase.
+	var liveStartTime *primitive.Timestamp
+	if *liveStartTimeStr != "" {
+		if *mode != "live-only" {
+			log.Fatal("Error: -live-start-timestamp can only be specified when -mode is 'live-only'")
+		}
+		ts, err := parseStartTimestamp(*liveStartTimeStr)
+		if err != nil {
+			log.Fatalf("Failed to parse -live-start-timestamp: %v", err)
+		}
+		liveStartTime = ts
 	}
 
 	// Create context with cancellation
@@ -56,16 +112,32 @@ func main() {
 		log.Info("Received interrupt signal. Shutting down...")
 		cancel()
 		// Give some time for graceful shutdown
-		time.Sleep(2 * time.Second)
+
+		log.Infof("Waiting for 15 seconds for workers to finish...")
+		time.Sleep(15 * time.Second)
 		os.Exit(0)
 	}()
 
 	// Create migrator
 	migrator := migration.NewMigrator(cfg, log)
+	migrator.LiveStartTime = liveStartTime
+	migrator.DontApply = *dontApply
+	migrator.DryRun = *dryRun
 
-	// Start migration/replication
+	// Start migration/replication/verification
 	startTime := time.Now()
 	log.Infof("Starting MongoDB to MongoDB %s process", *mode)
+
+	if *mode == "verify" {
+		verifier := migration.NewVerifier(cfg, log, *verifySampleSize, *verifyReportFile)
+		_, err := verifier.Verify(ctx)
+		if err != nil {
+			log.Fatalf("Verification failed: %v", err)
+		}
+		duration := time.Since(startTime)
+		log.Infof("Verification completed in %.2f seconds", duration.Seconds())
+		os.Exit(0)
+	}
 
 	if err := migrator.Start(ctx, *mode); err != nil {
 		// Check if the error is due to context cancellation (Ctrl+C)
@@ -93,12 +165,147 @@ func displayUsage() {
 	fmt.Println("  -config string")
 	fmt.Println("        Path to configuration file (default \"mongodb_replication_config.json\")")
 	fmt.Println("  -mode string")
-	fmt.Println("        Operation mode: 'migrate' or 'live' (default \"migrate\")")
+	fmt.Println("        Operation mode: 'migrate', 'live', or 'live-only' (default \"migrate\")")
+	fmt.Println("        Modes:")
+	fmt.Println("          migrate:")
+	fmt.Println("            Perform a one-time full migration. Copies all data and indexes from")
+	fmt.Println("            source to target, then exits immediately.")
+	fmt.Println("          live:")
+	fmt.Println("            Perform a full migration followed by real-time replication. Captures")
+	fmt.Println("            the replication position, copies all existing data and indexes (if configured), then")
+	fmt.Println("            automatically transitions to streaming real-time changes. Runs continuously.")
+	fmt.Println("          live-only:")
+	fmt.Println("            Perform real-time incremental replication only. Skips the initial data")
+	fmt.Println("            copy phase. Starts streaming real-time changes from the last saved resume token")
+	fmt.Println("            (or current moment if none exists), or from a custom position when")
+	fmt.Println("            -live-start-timestamp is specified.")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
+	fmt.Println("  -log-file string")
+	fmt.Println("        Path to log file (logs to both stdout and file when specified)")
+	fmt.Println("  -live-start-timestamp string")
+	fmt.Println("        Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	fmt.Println("        Debian command-line examples to get 'now':")
+	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
+	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
+	fmt.Println("  -dont-apply")
+	fmt.Println("        Don't apply mode (live-only migrations only, drops all target writes)")
+	fmt.Println("  -dry-run")
+	fmt.Println("        Dry run mode (live-only migrations only, drops all events in reader)")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
+	fmt.Println("  migrate -mode=live-only")
+	fmt.Println("  migrate -mode=live-only -dont-apply")
+	fmt.Println("  migrate -mode=live-only -dry-run")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=1716234000")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dont-apply")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
+	fmt.Println("  migrate -mode=live -log-file=migration.log")
+}
+
+// parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch
+// timestamp in seconds (e.g. 1716234000) or a standard RFC3339 formatted string (e.g. 2026-05-20T21:00:00Z).
+// It constructs and returns a BSON primitive.Timestamp structure with the scanned seconds component (T)
+// and an initial increment (I) set to 1, suitable for MongoDB change streams and oplog tailing.
+func parseStartTimestamp(s string) (*primitive.Timestamp, error) {
+	if s == "" {
+		return nil, nil
+	}
+
+	// Try parsing the string strictly as an integer. We use strconv.ParseInt rather than
+	// fmt.Sscan to ensure the entire string is a valid base-10 number (avoiding partial matches
+	// such as extracting "2026" from "2026-05-20...").
+	if secs, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return &primitive.Timestamp{T: uint32(secs), I: 1}, nil
+	}
+
+	// If it is not a plain integer, fall back to parsing as an RFC3339 date string.
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timestamp format, must be Unix epoch seconds or RFC3339 (e.g. 2026-05-20T21:00:00Z): %w", err)
+	}
+	return &primitive.Timestamp{T: uint32(t.Unix()), I: 1}, nil
+}
+
+// sanitizeConnectionString masks sensitive user credentials in MongoDB URIs.
+func sanitizeConnectionString(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	var prefix string
+	if strings.HasPrefix(uri, "mongodb://") {
+		prefix = "mongodb://"
+	} else if strings.HasPrefix(uri, "mongodb+srv://") {
+		prefix = "mongodb+srv://"
+	} else {
+		return uri
+	}
+
+	remaining := uri[len(prefix):]
+	atIndex := strings.LastIndex(remaining, "@")
+	if atIndex == -1 {
+		return uri
+	}
+
+	credentials := remaining[:atIndex]
+	hostAndParams := remaining[atIndex:]
+
+	colonIndex := strings.Index(credentials, ":")
+	if colonIndex == -1 {
+		return prefix + credentials + hostAndParams
+	}
+
+	username := credentials[:colonIndex]
+	return prefix + username + ":*****" + hostAndParams
+}
+
+// getSanitizedConfigJSON generates an indented JSON string representation of Config with credentials masked.
+func getSanitizedConfigJSON(cfg *config.Config) string {
+	if cfg == nil {
+		return "{}"
+	}
+
+	sanitizedCfg := *cfg
+	sanitizedCfg.DatabasePairs = make([]config.DatabasePair, len(cfg.DatabasePairs))
+	for i, pair := range cfg.DatabasePairs {
+		sanitizedPair := pair
+		sanitizedPair.Source.ConnectionString = sanitizeConnectionString(pair.Source.ConnectionString)
+		sanitizedPair.Target.ConnectionString = sanitizeConnectionString(pair.Target.ConnectionString)
+		sanitizedCfg.DatabasePairs[i] = sanitizedPair
+	}
+
+	data, err := json.MarshalIndent(sanitizedCfg, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("error marshalling config: %v", err)
+	}
+	return string(data)
+}
+
+// maximizeOpenFileLimit programmatically adjusts the maximum open files resource limit (ulimit -n) to 65536.
+func maximizeOpenFileLimit(log *logger.Logger) {
+	var rLimit syscall.Rlimit
+	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to get current open file resource limit: %v", err)
+		return
+	}
+
+	targetLimit := uint64(65536)
+	if rLimit.Max < targetLimit {
+		log.Warnf("System hard limit for open file descriptors is %d, which is lower than requested 65536. Setting limit to system maximum.", rLimit.Max)
+		targetLimit = rLimit.Max
+	}
+
+	rLimit.Cur = targetLimit
+	rLimit.Max = targetLimit
+
+	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to set open file resource limit (ulimit) to %d: %v", targetLimit, err)
+	} else {
+		log.Infof("Successfully adjusted open file descriptor resource limit (ulimit) to %d", targetLimit)
+	}
 }
